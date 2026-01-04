@@ -1,0 +1,180 @@
+import os
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from supabase import create_client, Client
+import google.generativeai as genai
+
+
+# Cargar variables de entorno
+load_dotenv()
+
+# 1. Configuración de Credenciales
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Configurar Gemini
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# Configurar OpenAI (Comentado por ahora)
+# from openai import OpenAI
+# OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+# ai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
+
+# 2. Inicializar Clientes
+app = FastAPI()
+
+# Configuración de CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Permitir todos los orígenes por ahora (dev)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Faltan las credenciales de Supabase en el archivo .env")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Modelo de datos para cuando recibamos texto simple
+class DocumentText(BaseModel):
+    content: str
+    filename: str
+
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "El cerebro RAG (Gemini Edition) está activo"}
+
+# --- ENDPOINT 1: INGESTA (Guardar datos) ---
+@app.post("/ingest-text")
+async def ingest_text(doc: DocumentText):
+    """
+    Recibe texto, lo vectoriza con Gemini y lo guarda en Supabase.
+    """
+    try:
+        print(f"DEBUG: Iniciando ingesta para {doc.filename}")
+        # Paso A: Crear el embedding (vector) usando Gemini
+        # Usamos 'models/text-embedding-004'
+        print("DEBUG: Llamando a Gemini...")
+        result = genai.embed_content(
+            model="models/text-embedding-004",
+            content=doc.content,
+            task_type="retrieval_document"
+        )
+        vector = result['embedding']
+        print("DEBUG: Vector generado correctamente.")
+
+        # Paso B: Guardar el documento 'Padre' en Supabase
+        print(f"DEBUG: Conectando a Supabase: {SUPABASE_URL}")
+        padre_response = supabase.table("documents").insert({
+            "content": doc.content,
+            "filename": doc.filename
+        }).execute()
+        
+        if not padre_response.data:
+            raise HTTPException(status_code=500, detail="Error al insertar documento padre")
+
+        padre_id = padre_response.data[0]['id']
+        print(f"DEBUG: Documento padre insertado ID: {padre_id}")
+
+        # Paso C: Guardar el 'Hijo' (Chunk) con el vector en la columna correcta
+        supabase.table("documents_chunks").insert({
+            "document_id": padre_id,
+            "content": doc.content,
+            "embedding_gemini": vector # Usamos la columna específica para Gemini
+        }).execute()
+        print("DEBUG: Chunk insertado correctamente.")
+
+        return {"status": "success", "id": padre_id, "provider": "gemini"}
+
+    except Exception as e:
+        print(f"ERROR en ingesta: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+# --- ENDPOINT 2: BÚSQUEDA (RAG) ---
+class Query(BaseModel):
+    question: str
+
+@app.post("/chat")
+async def chat(query: Query):
+    try:
+        print(f"DEBUG: Pregunta recibida: {query.question}")
+        # 1. Vectorizar la pregunta del usuario con Gemini
+        result = genai.embed_content(
+            model="models/text-embedding-004",
+            content=query.question,
+            task_type="retrieval_query"
+        )
+        query_vector = result['embedding']
+        print("DEBUG: Vector de pregunta generado.")
+
+        # 2. Llamar a la función RPC de Supabase para Gemini
+        # Bajamos el threshold a 0.1 para asegurar que traiga algo si hay coincidencia
+        print("DEBUG: Ejecutando RPC match_documents_gemini...")
+        rpc_response = supabase.rpc("match_documents_gemini", {
+            "query_embedding": query_vector,
+            "match_threshold": 0.1, 
+            "match_count": 5
+        }).execute()
+        
+        contexto_chunks = rpc_response.data
+        print(f"DEBUG: Chunks encontrados: {len(contexto_chunks)}")
+        
+        # Enriquecer chunks con filename
+        if contexto_chunks:
+            doc_ids = list(set([chunk['document_id'] for chunk in contexto_chunks]))
+            print(f"DEBUG: Buscando filenames para IDs: {doc_ids}")
+            
+            docs_response = supabase.table("documents").select("id, filename").in_("id", doc_ids).execute()
+            
+            # Crear mapa id -> filename
+            filename_map = {doc['id']: doc['filename'] for doc in docs_response.data}
+            
+            # Agregar filename a cada chunk
+            for chunk in contexto_chunks:
+                chunk['filename'] = filename_map.get(chunk['document_id'], "Unknown")
+
+        # Construir el contexto como texto
+        contexto_str = "\n\n".join([f"Fuente ({chunk.get('filename', 'Unknown')}): {chunk['content']}" for chunk in contexto_chunks])
+
+        # 3. Generar respuesta con Gemini (RAG)
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        prompt = f"""
+        Eres un asistente inteligente. Usa la siguiente información de contexto para responder a la pregunta del usuario.
+        Si la respuesta no está en el contexto, di que no tienes esa información.
+        
+        Contexto:
+        {contexto_str}
+        
+        Pregunta:
+        {query.question}
+        """
+        
+        print("DEBUG: Generando respuesta con Gemini...")
+        response = model.generate_content(prompt)
+        
+        # Verificar si hay respuesta válida
+        respuesta_texto = "No se pudo generar respuesta."
+        if response.candidates:
+             respuesta_texto = response.text
+        else:
+             print("DEBUG: Gemini no devolvió candidatos (posible bloqueo de seguridad).")
+
+        return {
+            "respuesta_ia": respuesta_texto,
+            "fuentes": contexto_chunks
+        }
+
+    except Exception as e:
+        print(f"ERROR en chat: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
