@@ -9,3 +9,4 @@ python-multipart
 pyjwt
 pypdf
 Pillow
+passlib[bcrypt]
